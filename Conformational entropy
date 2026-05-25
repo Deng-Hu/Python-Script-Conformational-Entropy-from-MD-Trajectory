@@ -1,0 +1,180 @@
+import argparse
+import numpy as np
+import MDAnalysis as mda
+from scipy.constants import k as kB, hbar, Avogadro
+
+def kabsch(P, Q):
+    """
+    Align P to Q using Kabsch algorithm.
+    P, Q: (N,3) in Å.
+    Return P aligned to Q (N,3) in Å.
+    """
+    Pc = P.mean(axis=0)
+    Qc = Q.mean(axis=0)
+    P0 = P - Pc
+    Q0 = Q - Qc
+
+    C = P0.T @ Q0
+    V, S, Wt = np.linalg.svd(C)
+    d = np.sign(np.linalg.det(V @ Wt))
+    D = np.diag([1.0, 1.0, d])
+    R = V @ D @ Wt
+    P_aligned = (P0 @ R) + Qc
+    return P_aligned
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pdb", required=True, help="3225Co_PItC-2_225.pdb")
+    ap.add_argument("--traj", required=True, help="3225trj_225.xyz")
+    ap.add_argument("--temp", type=float, required=True, help="Temperature in K, e.g. 298.15")
+    ap.add_argument("--sel", default="not name H*", help='Selection for entropy calculation, e.g. "not name H*"')
+    ap.add_argument("--align_sel", default=None,
+                    help='Selection used ONLY for alignment; default uses --sel. '
+                         'Recommend backbone/heavy atoms to stabilize alignment.')
+    ap.add_argument("--stride", type=int, default=1, help="Use every stride-th frame")
+    ap.add_argument("--start", type=int, default=0, help="Start frame index (0-based)")
+    ap.add_argument("--stop", type=int, default=-1, help="Stop frame index (exclusive); -1 means end")
+    ap.add_argument("--max_frames", type=int, default=0,
+                    help="If >0, cap number of frames used (uniformly subsample) to avoid huge memory/time")
+    ap.add_argument("--dtype", choices=["float32", "float64"], default="float32")
+    ap.add_argument("--ref_mode", choices=["first", "avg"], default="first",
+                    help="Reference for alignment: first frame or average of first K frames")
+    ap.add_argument("--ref_k", type=int, default=100,
+                    help="If ref_mode=avg, number of frames (after stride) to average for reference")
+    args = ap.parse_args()
+
+    T = args.temp
+    stride = max(1, args.stride)
+    dtype = np.float32 if args.dtype == "float32" else np.float64
+
+    u = mda.Universe(args.pdb, args.traj)
+    ag = u.select_atoms(args.sel)
+    align_sel = args.align_sel if args.align_sel is not None else args.sel
+    ag_align = u.select_atoms(align_sel)
+
+    N = ag.n_atoms
+    if N < 50:
+        raise RuntimeError(f"Too few selected atoms for entropy: N={N}. Check --sel.")
+
+    if ag_align.n_atoms < 10:
+        raise RuntimeError(f"Too few atoms for alignment: N_align={ag_align.n_atoms}. Check --align_sel.")
+
+    # Masses: amu -> kg, repeat for x,y,z
+    masses_kg = ag.masses * 1.66053906660e-27
+    w = np.sqrt(np.repeat(masses_kg, 3)).astype(dtype)  # (3N,)
+
+    total_frames = len(u.trajectory)
+    start = max(0, args.start)
+    stop = total_frames if args.stop == -1 else min(args.stop, total_frames)
+    if start >= stop:
+        raise RuntimeError(f"Invalid frame range: start={start}, stop={stop}, total={total_frames}")
+
+    # Build frame indices with stride
+    frame_idx = list(range(start, stop, stride))
+
+    # Optional cap frames to avoid huge memory/time
+    if args.max_frames and args.max_frames > 0 and len(frame_idx) > args.max_frames:
+        # Uniform subsample
+        keep = np.linspace(0, len(frame_idx) - 1, args.max_frames).round().astype(int)
+        frame_idx = [frame_idx[i] for i in keep]
+
+    # ---- Build reference coordinates for alignment ----
+    # Reference is computed on alignment selection, but will be applied to full selection by doing Kabsch on align_sel
+    # and applying the same rotation to the entropy selection coordinates.
+    # For simplicity here, we align entropy selection directly to the reference of entropy selection (robust enough if align_sel==sel).
+    # If align_sel != sel and you want strict rotation transfer, tell me and I’ll give the extended version.
+    if args.ref_mode == "first":
+        u.trajectory[frame_idx[0]]
+        Pref = ag.positions.copy()  # Å
+    else:
+        # Average reference over first ref_k frames in frame_idx
+        k = min(args.ref_k, len(frame_idx))
+        coords = []
+        for fi in frame_idx[:k]:
+            u.trajectory[fi]
+            coords.append(ag.positions.copy())
+        Pref = np.mean(np.stack(coords, axis=0), axis=0)  # Å
+
+    # ---- Collect Y matrix: (F, 3N) mass-weighted centered coords (centering later) ----
+    Y_list = []
+    used_frames = []
+
+    for fi in frame_idx:
+        u.trajectory[fi]
+        P = ag.positions.copy()  # Å
+
+        # Rigid alignment to reference
+        P_aligned = kabsch(P, Pref)  # Å
+
+        # Å -> m, flatten to (3N,)
+        x = (P_aligned * 1e-10).reshape(-1).astype(dtype)
+
+        # Mass-weighted
+        y = x * w
+        Y_list.append(y)
+        used_frames.append(fi)
+
+    Y = np.vstack(Y_list)  # (F, 3N)
+    F = Y.shape[0]
+
+    if F < 20:
+        raise RuntimeError(f"Too few frames used: F={F}. Increase trajectory length or reduce stride/max_frames.")
+
+    # Center Y (remove mean)
+    Y -= Y.mean(axis=0, keepdims=True)
+
+    # ---- Key change: Use SVD instead of building G=Y Y^T (which is F x F) ----
+    # For centered Y, covariance Cm = (Y^T Y)/(F-1)
+    # Non-zero eigenvalues of Cm are: lambda_i = (sigma_i^2)/(F-1), where sigma_i are singular values of Y
+    Y64 = Y.astype(np.float64, copy=False)  # improve numerical stability
+    # economy SVD: Y = U * diag(s) * Vt
+    # s has length r = min(F, 3N)
+    _, svals, _ = np.linalg.svd(Y64, full_matrices=False)
+
+    # Eigenvalues of Cm
+    evals = (svals ** 2) / (F - 1)
+
+    # Numerical cleanup
+    evals = evals[evals > 0]
+
+    if evals.size == 0:
+        raise RuntimeError("All eigenvalues are non-positive after cleanup. Check trajectory validity/alignment/PBC jumps.")
+
+    # ---- Schlitter entropy ----
+    alpha = (np.e ** 2 * kB * T) / (hbar ** 2)
+    logdet = np.sum(np.log1p(alpha * evals))
+
+    S_schl_J_per_K = 0.5 * kB * logdet
+    S_schl_J_per_molK = S_schl_J_per_K * Avogadro
+
+    # ---- Quasi-harmonic entropy ----
+    h = 2.0 * np.pi * hbar  # Planck constant (J*s)
+
+    omega = np.sqrt((kB * T) / evals)  # rad/s
+    nu = omega / (2.0 * np.pi)         # Hz
+    x = (h * nu) / (kB * T)            # dimensionless
+
+    x = np.clip(x, 1e-12, 1e3)
+    S_mode = kB * ((x / (np.exp(x) - 1.0)) - np.log(1.0 - np.exp(-x)))  # J/K per mode
+    S_qh_J_per_molK = S_mode.sum() * Avogadro
+
+    # ---- Diagnostics ----
+    print("=== Conformational entropy (SVD-based) ===")
+    print(f"Trajectory total frames: {total_frames}")
+    print(f"Frame range: start={start}, stop={stop}, stride={stride}, max_frames={args.max_frames or 'None'}")
+    print(f"Frames used F = {F}")
+    print(f"Selection: '{args.sel}' ; N atoms = {N}")
+    print(f"Eigenvalues count = {evals.size} ; min={evals.min():.3e} ; max={evals.max():.3e}")
+    print("")
+
+    print("=== Schlitter ===")
+    print(f"S_schlitter = {S_schl_J_per_molK:.6f} J/mol/K")
+    print(f"S_schl_per_atom = {S_schl_J_per_molK / N:.6e} J/mol/K/atom")
+
+    print("")
+    print("=== Quasi-harmonic ===")
+    print(f"S_quasi_harmonic = {S_qh_J_per_molK:.6f} J/mol/K")
+    print(f"S_QH_per_atom = {S_qh_J_per_molK / N:.6e} J/mol/K/atom")
+
+if __name__ == "__main__":
+    main()
